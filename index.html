@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Rasengan vs Chidori</title>
+<link rel="icon" href="data:,">
+<style>
+  html, body { height: 100%; margin: 0; background: #000; overflow: hidden;
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; color: #e8f4ff; }
+  video, canvas {                        /* mirrored selfie view; same box => effects line up with the hand */
+    position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1);
+  }
+  #hint {
+    position: fixed; left: 50%; bottom: calc(14px + env(safe-area-inset-bottom)); transform: translateX(-50%);
+    display: flex; flex-wrap: wrap; gap: 6px 16px; justify-content: center; width: max-content; max-width: calc(100% - 24px);
+    padding: 8px 16px; border-radius: 18px; background: rgba(0, 0, 0, .55); backdrop-filter: blur(6px);
+    font-size: 13px; pointer-events: none;
+  }
+  #hint b { color: #7ad7ff; font-weight: 600; }
+  #msg {
+    position: fixed; inset: 0; z-index: 3; display: flex; flex-direction: column; gap: 14px;
+    align-items: center; justify-content: center; padding: 24px; text-align: center; background: #05070d; color: #8aa0b8;
+  }
+  #msg[hidden] { display: none; }
+  #msg h1 { margin: 0; font-size: 28px; color: #e8f4ff; letter-spacing: .02em; }
+  #msg h1 span { color: #4aa8ff; }
+  #start {
+    font: inherit; font-weight: 600; color: #fff; cursor: pointer; padding: 12px 26px; border-radius: 99px;
+    background: linear-gradient(#2f8cff, #1b63e0); border: 0; box-shadow: 0 0 24px #2f8cff66;
+  }
+  #start:active { transform: scale(.96); }
+</style>
+</head>
+<body>
+<video id="video" playsinline muted autoplay></video>
+<canvas id="fx"></canvas>
+
+<div id="hint">
+  <span>✋ Open hand, thumb out → <b>Rasengan</b></span>
+  <span>🤚 Flat hand, thumb tucked → <b>Chidori</b></span>
+  <span>✊ Fist after Rasengan → <b>release</b></span>
+</div>
+
+<div id="msg">
+  <h1><span>Rasengan</span> vs Chidori</h1>
+  <button id="start">Start camera</button>
+  <div id="status">Hand-tracking effects. Everything runs in your browser.</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script>
+/* ==================================================================
+   SETTINGS  (tweak these)
+   ================================================================== */
+const THUMB_OUT = 0.70;      // thumb tip must be this far from the index knuckle (x hand size) to count as "out"
+const THUMB_STAY = 0.50;     // ...but once Rasengan is up it stays until the thumb comes closer than this
+const RASENGAN_RISE = 1.7;   // how high the ball floats above the palm (x hand size)
+const RASENGAN_SIZE = 1.0;   // ball radius (x hand size)
+
+/* ==================================================================
+   HAND POSE  ->  'rasengan' | 'chidori' | 'fist' | null
+   ================================================================== */
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+function readHand(p, prevMode) {                       // p = 21 landmarks in pixels
+  const palm = dist(p[0], p[9]) || 1e-6;               // wrist -> middle knuckle = hand size
+  const up = (tip, pip) => dist(p[tip], p[0]) > dist(p[pip], p[0]) * 1.1;
+  const n = [up(8, 6), up(12, 10), up(16, 14), up(20, 18)].filter(Boolean).length;   // extended fingers (no thumb)
+  const thumbGap = dist(p[4], p[5]) / palm;
+  const thumbOut = thumbGap > (prevMode === 'rasengan' ? THUMB_STAY : THUMB_OUT);
+  if (n === 4) return thumbOut ? 'rasengan' : 'chidori';
+  if (n === 0) return 'fist';
+  return null;
+}
+
+/* ==================================================================
+   STATE
+   ================================================================== */
+const canvas = document.getElementById('fx'), ctx = canvas.getContext('2d');
+const video = document.getElementById('video');
+canvas.width = 1280; canvas.height = 720;
+const TAU = Math.PI * 2;
+const rnd = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const ease = k => 1 - Math.pow(1 - k, 3);
+
+const slots = [0, 1].map(() => ({ mode: null, want: 0, a: 0, x: 0, y: 0, r: 60, dx: 0, dy: -1, cand: null, n: 0, bolts: null, boltT: 0 }));
+let handsPx = [];                                      // last detected hands (pixels) for the skeleton
+let blast = null, lastBlast = -1e9;
+
+function onResults(res) {
+  const W = canvas.width, H = canvas.height;
+  handsPx = (res.multiHandLandmarks || [])
+    .map(p => p.map(q => ({ x: q.x * W, y: q.y * H })))
+    .sort((a, b) => a[0].x - b[0].x);                  // stable slot order: left-most hand first
+  slots.forEach((s, i) => {
+    const p = handsPx[i];
+    if (!p) { s.want = 0; s.cand = null; return; }
+    const m = readHand(p, s.mode);
+    s.n = m === s.cand ? s.n + 1 : 1; s.cand = m;
+    if (s.n < 2) return;                               // pose must hold for 2 frames (anti-flicker)
+
+    if (m === 'rasengan' || m === 'chidori') {
+      if (s.mode !== m) { s.mode = m; s.a = Math.min(s.a, 0.15); }
+      const cx = (p[0].x + p[5].x + p[9].x + p[13].x + p[17].x) / 5;
+      const cy = (p[0].y + p[5].y + p[9].y + p[13].y + p[17].y) / 5;
+      const r = dist(p[0], p[9]) || 1;
+      const k = s.a > 0.02 ? 0.55 : 1;                 // glide while tracking, snap on first appearance
+      s.x += (cx - s.x) * k; s.y += (cy - s.y) * k; s.r += (r - s.r) * k;
+      s.dx = (p[9].x - p[0].x) / r; s.dy = (p[9].y - p[0].y) / r;
+      s.want = 1;
+    } else {
+      if (m === 'fist' && s.mode === 'rasengan' && s.a > 0.5 && !blast && performance.now() - lastBlast > 1200) {
+        startBlast(s); s.a = 0;
+      }
+      s.want = 0;
+    }
+  });
+}
+
+/* ==================================================================
+   DRAWING
+   ================================================================== */
+const LINKS = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+               [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+
+function drawSkeletons() {
+  const u = canvas.width / 1280;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.lineCap = 'round';
+  handsPx.forEach(p => {
+    ctx.strokeStyle = 'rgba(70, 215, 245, .9)'; ctx.lineWidth = 1.6 * u; ctx.beginPath();
+    LINKS.forEach(([a, b]) => { ctx.moveTo(p[a].x, p[a].y); ctx.lineTo(p[b].x, p[b].y); });
+    ctx.stroke();
+    ctx.fillStyle = '#a8f0ff';
+    p.forEach(q => { ctx.beginPath(); ctx.arc(q.x, q.y, 2.2 * u, 0, TAU); ctx.fill(); });
+  });
+}
+
+/* ---------- Rasengan: swirling ball above the palm ---------- */
+const STREAKS = Array.from({ length: 110 }, () => ({
+  lat: Math.asin(rnd(-1, 1)), lon: rnd(0, TAU), v: rnd(1.4, 4.2) * (Math.random() < .5 ? 1 : -1), len: rnd(.25, .8),
+}));
+const SPARKS = Array.from({ length: 26 }, () => ({ a: rnd(0, TAU), rad: rnd(1.15, 2.1), v: rnd(.6, 2.2), s: rnd(.8, 2.2) }));
+
+function drawRasengan(s, t) {
+  const e = ease(s.a);
+  const R = s.r * RASENGAN_SIZE * (0.25 + 0.75 * e) * (1 + 0.03 * Math.sin(t * 14));
+  const cx = s.x, cy = s.y - s.r * RASENGAN_RISE * e;
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.globalAlpha = clamp(s.a * 1.4, 0, 1);
+
+  let g = ctx.createRadialGradient(cx, cy, R * 0.5, cx, cy, R * 2.2);          // halo
+  g.addColorStop(0, 'rgba(60, 140, 255, .38)'); g.addColorStop(1, 'rgba(30, 90, 255, 0)');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(cx, cy, R * 2.2, 0, TAU); ctx.fill();
+
+  g = ctx.createRadialGradient(cx - R * .15, cy - R * .15, R * .05, cx, cy, R);  // body
+  g.addColorStop(0, 'rgba(190, 230, 255, .7)'); g.addColorStop(.35, 'rgba(70, 160, 255, .6)');
+  g.addColorStop(.8, 'rgba(25, 90, 225, .55)'); g.addColorStop(1, 'rgba(20, 70, 200, .1)');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(cx, cy, R, 0, TAU); ctx.fill();
+
+  ctx.lineCap = 'round';
+  ctx.lineWidth = Math.max(1, R * 0.03);                                       // spiral arms (flat swirl)
+  for (let k = 0; k < 6; k++) {
+    ctx.strokeStyle = 'rgba(200, 235, 255, .3)'; ctx.beginPath();
+    for (let i = 0; i <= 22; i++) {
+      const q = i / 22, ang = k * TAU / 6 + q * 2.4 - t * 7, rr = R * q * 0.98;
+      i ? ctx.lineTo(cx + Math.cos(ang) * rr, cy + Math.sin(ang) * rr) : ctx.moveTo(cx, cy);
+    }
+    ctx.stroke();
+  }
+
+  const tilt = 0.55, ct = Math.cos(tilt), st = Math.sin(tilt);                 // streaks on a spinning sphere
+  ctx.lineWidth = Math.max(1, R * 0.022);
+  STREAKS.forEach(o => {
+    const pt = lon => {
+      const x3 = Math.cos(o.lat) * Math.cos(lon), y3 = Math.sin(o.lat), z3 = Math.cos(o.lat) * Math.sin(lon);
+      return [x3, y3 * ct - z3 * st, y3 * st + z3 * ct];
+    };
+    const l = o.lon + t * o.v, a = pt(l), b = pt(l - o.len * Math.sign(o.v));
+    ctx.strokeStyle = `rgba(215, 240, 255, ${a[2] > 0 ? .6 : .16})`;
+    ctx.beginPath(); ctx.moveTo(cx + a[0] * R, cy + a[1] * R); ctx.lineTo(cx + b[0] * R, cy + b[1] * R); ctx.stroke();
+  });
+
+  g = ctx.createRadialGradient(cx, cy, 0, cx, cy, R * 0.38);                    // white core + rotating star
+  g.addColorStop(0, 'rgba(255, 255, 255, .95)'); g.addColorStop(.4, 'rgba(190, 228, 255, .45)'); g.addColorStop(1, 'rgba(120, 190, 255, 0)');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(cx, cy, R * 0.38, 0, TAU); ctx.fill();
+  ctx.strokeStyle = 'rgba(255, 255, 255, .6)'; ctx.lineWidth = Math.max(1, R * 0.018);
+  for (let k = 0; k < 4; k++) {
+    const ang = k * Math.PI / 4 + t * 2.5;
+    ctx.beginPath(); ctx.moveTo(cx - Math.cos(ang) * R * .3, cy - Math.sin(ang) * R * .3);
+    ctx.lineTo(cx + Math.cos(ang) * R * .3, cy + Math.sin(ang) * R * .3); ctx.stroke();
+  }
+
+  ctx.shadowColor = 'rgba(150, 210, 255, 1)'; ctx.shadowBlur = R * 0.12;        // two orbiting wind blades (thin, tapered)
+  [[1.22, .36, 4.2, .2], [1.3, .44, -3.1, 2.4]].forEach(([rx, ry, sp, ph]) => {
+    const rot = t * sp + ph;
+    [[.045, 1.0], [.028, .8], [.014, .6]].forEach(([w, len]) => {
+      ctx.strokeStyle = 'rgba(225, 242, 255, .6)'; ctx.lineWidth = R * w;
+      ctx.beginPath(); ctx.ellipse(cx, cy, R * rx, R * ry, rot, Math.PI * .1, Math.PI * (.1 + len * .9)); ctx.stroke();
+    });
+  });
+  ctx.shadowBlur = 0;
+
+  ctx.fillStyle = 'rgba(190, 230, 255, .9)';                                    // drifting sparks
+  SPARKS.forEach(o => {
+    const ang = o.a + t * o.v, rr = R * o.rad * (1 + .08 * Math.sin(t * 3 + o.a));
+    ctx.beginPath(); ctx.arc(cx + Math.cos(ang) * rr, cy + Math.sin(ang) * rr * .8, o.s * R * 0.02 + .6, 0, TAU); ctx.fill();
+  });
+  ctx.restore();
+}
+
+/* ---------- Chidori: crackling lightning from the hand ---------- */
+function bolt(x, y, ang, len, depth, out) {                // jagged polyline, with occasional branches
+  const n = Math.max(6, Math.round(len / 13)), step = len / n, pts = [[x, y]];
+  for (let i = 0; i < n; i++) {
+    ang += rnd(-.5, .5); x += Math.cos(ang) * step; y += Math.sin(ang) * step; pts.push([x, y]);
+    if (depth < 2 && Math.random() < .07) bolt(x, y, ang + rnd(-1.1, 1.1), len * rnd(.25, .5), depth + 1, out);
+  }
+  out.push(pts);
+}
+
+function drawChidori(s, t) {
+  const e = ease(s.a), u = clamp(s.r / 90, .6, 2.2);
+  const cx = s.x + s.dx * s.r * 0.6, cy = s.y + s.dy * s.r * 0.6;               // core sits toward the fingers
+  if (!s.bolts || t - s.boltT > 0.055) {                                          // new bolt pattern ~18x per second
+    const list = [];
+    for (let i = 0; i < 12; i++) bolt(0, 0, rnd(0, TAU), s.r * rnd(.9, 4.4), 0, list);
+    const path = new Path2D();
+    list.forEach(pts => { path.moveTo(pts[0][0], pts[0][1]); pts.slice(1).forEach(q => path.lineTo(q[0], q[1])); });
+    s.bolts = path; s.boltT = t;
+  }
+  const fl = .8 + .4 * Math.random();
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.fillStyle = `rgba(40, 80, 255, ${.03 * fl * e})`; ctx.fillRect(0, 0, canvas.width, canvas.height);   // room flicker
+
+  ctx.translate(cx, cy); ctx.scale(.35 + .65 * e, .35 + .65 * e);
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  ctx.strokeStyle = `rgba(40, 90, 255, ${.12 * e})`; ctx.lineWidth = 8 * u; ctx.stroke(s.bolts);
+  ctx.strokeStyle = `rgba(90, 150, 255, ${.5 * e})`; ctx.lineWidth = 2.6 * u; ctx.stroke(s.bolts);
+  ctx.strokeStyle = `rgba(225, 238, 255, ${.8 * e})`; ctx.lineWidth = 1 * u; ctx.stroke(s.bolts);
+
+  let g = ctx.createRadialGradient(0, 0, 0, 0, 0, s.r * 4);                      // wide ambient glow
+  g.addColorStop(0, `rgba(60, 110, 255, ${.34 * fl * e})`); g.addColorStop(1, 'rgba(30, 60, 255, 0)');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, s.r * 4, 0, TAU); ctx.fill();
+  const cr = s.r * .85 * fl;                                                      // white-hot core
+  g = ctx.createRadialGradient(0, 0, 0, 0, 0, cr);
+  g.addColorStop(0, 'rgba(255, 255, 255, .95)'); g.addColorStop(.35, 'rgba(170, 205, 255, .6)'); g.addColorStop(1, 'rgba(80, 130, 255, 0)');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, cr, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+
+/* ---------- Release: big cyan burst ---------- */
+function startBlast(s) {
+  lastBlast = performance.now();
+  const cx = s.x, cy = s.y - s.r * RASENGAN_RISE;
+  blast = { x: cx, y: cy, R: s.r * RASENGAN_SIZE, t0: lastBlast,
+    sparks: Array.from({ length: 70 }, () => ({ a: rnd(0, TAU), v: rnd(.3, 1.1), l: rnd(.02, .1) })),
+    blobs: Array.from({ length: 12 }, () => ({ a: rnd(0, TAU), d: rnd(.1, .75), s: rnd(.25, .55) })) };    // cloud-like plume
+}
+
+function drawBlast(now) {
+  const k = (now - blast.t0) / 1200;
+  if (k >= 1) { blast = null; return; }
+  const e = ease(k), fade = Math.pow(1 - k, 1.6), D = Math.hypot(canvas.width, canvas.height);
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.fillStyle = `rgba(150, 220, 255, ${.55 * Math.pow(1 - k, 3)})`; ctx.fillRect(0, 0, canvas.width, canvas.height);   // flash
+
+  const rad = blast.R + e * D * .75;
+  let g = ctx.createRadialGradient(blast.x, blast.y, 0, blast.x, blast.y, rad);                                          // plume
+  g.addColorStop(0, `rgba(235, 250, 255, ${.85 * fade})`); g.addColorStop(.25, `rgba(150, 225, 255, ${.8 * fade})`);
+  g.addColorStop(.65, `rgba(60, 160, 255, ${.5 * fade})`); g.addColorStop(1, 'rgba(30, 100, 255, 0)');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(blast.x, blast.y, rad, 0, TAU); ctx.fill();
+
+  blast.blobs.forEach(o => {                                                                                              // billowing cloud blobs
+    const d = o.d * e * D * .6, bx = blast.x + Math.cos(o.a) * d, by = blast.y + Math.sin(o.a) * d, br = o.s * D * (.15 + .5 * e);
+    const bg = ctx.createRadialGradient(bx, by, 0, bx, by, br);
+    bg.addColorStop(0, `rgba(190, 240, 255, ${.5 * fade})`); bg.addColorStop(1, 'rgba(60, 160, 255, 0)');
+    ctx.fillStyle = bg; ctx.beginPath(); ctx.arc(bx, by, br, 0, TAU); ctx.fill();
+  });
+
+  ctx.strokeStyle = `rgba(200, 238, 255, ${.4 * Math.pow(1 - k, 2)})`; ctx.lineWidth = 2 + 7 * (1 - k);                  // faint shockwave ring
+  ctx.beginPath(); ctx.arc(blast.x, blast.y, blast.R + e * D * .55, 0, TAU); ctx.stroke();
+
+  ctx.lineCap = 'round'; ctx.lineWidth = 1.6; ctx.strokeStyle = `rgba(225, 245, 255, ${.7 * fade})`;                       // flying sparks
+  ctx.beginPath();
+  blast.sparks.forEach(o => {
+    const d0 = blast.R * .5 + o.v * e * D * .7, d1 = d0 + o.l * D * (1 - k);
+    ctx.moveTo(blast.x + Math.cos(o.a) * d0, blast.y + Math.sin(o.a) * d0);
+    ctx.lineTo(blast.x + Math.cos(o.a) * d1, blast.y + Math.sin(o.a) * d1);
+  });
+  ctx.stroke();
+  ctx.restore();
+}
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.1, (now - last) / 1000); last = now;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  drawSkeletons();
+  slots.forEach(s => {
+    const k = 1 - Math.pow(1 - (s.want ? .16 : .3), dt * 60);                     // smooth fade in / out
+    s.a += (s.want - s.a) * k;
+    if (!s.want && s.a < .01) s.a = 0;
+    if (s.a > 0) (s.mode === 'rasengan' ? drawRasengan : drawChidori)(s, now / 1000);
+  });
+  if (blast) drawBlast(now);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+/* ==================================================================
+   CAMERA + MEDIAPIPE
+   ================================================================== */
+async function start() {
+  const status = document.getElementById('status'), btn = document.getElementById('start');
+  btn.hidden = true;
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error('Camera needs https:// (or localhost).');
+    if (typeof Hands === 'undefined') throw new Error('Could not load MediaPipe. Check your internet connection.');
+    status.textContent = 'Starting camera…';
+    video.srcObject = await navigator.mediaDevices.getUserMedia(
+      { video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+    await video.play();
+    canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+
+    status.textContent = 'Loading hand model…';
+    const hands = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${f}` });
+    hands.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+    hands.onResults(onResults);
+    await hands.initialize();
+    document.getElementById('msg').hidden = true;
+
+    let busy = false;
+    (async function loop() {
+      if (!busy && video.readyState >= 2) {
+        busy = true;
+        try { await hands.send({ image: video }); } catch (e) { console.error(e); }
+        busy = false;
+      }
+      requestAnimationFrame(loop);
+    })();
+  } catch (e) {
+    console.error(e);
+    status.textContent = e.name === 'NotAllowedError' ? 'Camera permission was denied. Allow it and try again.' : (e.message || String(e));
+    btn.hidden = false; btn.textContent = 'Try again';
+  }
+}
+document.getElementById('start').onclick = start;
+</script>
+</body>
+</html>
